@@ -1,112 +1,86 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS, cross_origin
 import requests
 import json
 import os
 from groq import Groq
 from data import get_book_details, insert_book_details, get_all_history
+from langchain.text_splitter import CharacterTextSplitter
+from SummaryRecipe import SummaryRecipe
 
 
 app = Flask(__name__)
+cors = CORS(app)
 
-# Set your Groq AI API key and secret
-GROQ_API_KEY = 'trial1'
-GROQ_API_SECRET = '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'
+MINIMUM_BOOK_TOKENS = 1000
 
 # Set the Gutenberg project API endpoint
 GUTENBERG_API_ENDPOINT = 'https://www.gutenberg.org'
 
-# Set the Groq AI API endpoint
-GROQ_API_ENDPOINT = 'https://api.groq.ai/v1/analyze'
-
-SYSTEM_PROMPT = """
-You are a summarization engine that outputs in markdown style. Users will feed you a piece of text, and you will return ONLY a summary of the content provided at a specified level of detail. Below are the allowed levels for your summaries:
-- Summary Level 1: Headline Summary - Provide a 10-20 words with a 
-single sentence bullet point headline that captures the overarching 
-theme or main point for the content for each paragraph.
-
-- Summary Level 2: Sentence-Level Summary - Provide a 20-30 words summary with 1-2 simple sentences that capture the main point in the text. 
-
-- Summary Level 3: Paragraph Level-Summary - Provide a bullet points 
-summary where each bullet points is a single sentence or headline 
-(10-15 words) that captures the overarching theme or main point for 
-each paragraph in the text.
-
-- Summary Level 4: One-Paragraph Summary - Provide a 30-50 words summary 
-where you introduce the main point, key arguments, or narrative arc 
-in a short paragraph, adding context to the headline.
-
-- Summary Level 5: Executive Summary - Provide a 50-80 words summary with 
-the key points, findings, and implications in a high-level overview 
-suitable for decision-making. 
-
-- Summary Level 6: Structured Summary - Provide a 80-100 words summary 
-where you break down the content into predefined relevant sections 
-(one example would be: Introduction, Methods, Results, Conclusion if its a paper), 
-providing a clear overview of each major component.
-
-- Summary Level 7: Detailed Summary - Summarize in 100-120 words 
-covering all main points and supporting arguments or evidence in a 
-comprehensive summary that conveys a thorough understanding. 
-
-Inputs from the user will always follow this structure:
-
-'''
-text input:
-<user text input>
-Summary level: <the summary level as a number from 1-10>
-output:
-'''"""
-
 @app.route('/get-past-searches', methods=['GET'])
+@cross_origin()
 def get_past_searches():
     books = get_all_history()
     return jsonify(books)
 
 @app.route('/analyze', methods=['POST'])
+@cross_origin()
 def analyze_story():
-    # Get the book ID from the request body
     book_id = request.get_json()['book_id']
     book = get_book_details(book_id)
     if book:
         return book
 
-    # Fetch the text from the Gutenberg project
+    title = fetch_book_title(book_id)
+
     text = fetch_text_from_gutenberg(book_id)
 
-    title = fetch_book_title(book_id)
-    import pdb; pdb.set_trace()
+    source = ''
+
+    if len(text) < MINIMUM_BOOK_TOKENS:
+        # This means that the text is not there
+        source = 'title'
+        analysis = analyze_title_with_groq(title, f'{GUTENBERG_API_ENDPOINT}/ebooks/{book_id}')
+    else:
+        # Analyze the story text
+        source = 'text'
+        analysis = analyze_text_with_groq(text)
+
+    
+    author = analysis['author']
+    language = analysis['language']
+    summary = analysis['summary']
+    sentiment =  analysis['sentiment']
+    key_characters =  ",".join(analysis['key_characters'])
+
     is_book_inserted = insert_book_details({
         'book_id': book_id,
         'title': title,
-        'author': title,
-        'language': title,
-        'summary': title,
-        'sentiment': title,
-        'key_characters': title,
+        'author': author,
+        'language': language,
+        'summary': summary,
+        'sentiment': sentiment,
+        'key_characters': key_characters,
         'book_text': text
     })
 
-    # Analyze the story using Groq AI
-    # analysis = analyze_text_with_groq(text)
-
-    # Return the analysis as JSON
-    # return jsonify({'analysis': analysis})
     return jsonify({
-        'id': book_id,
+        'book_id': book_id,
         'title': title,
-        'summary': title,
-        'text': text,
+        'author': author,
+        'language': language,
+        'summary': summary,
+        'sentiment': sentiment,
+        'key_characters': key_characters,
+        'source': source,
         'is_book_inserted': is_book_inserted
     })
 
 def fetch_text_from_gutenberg(book_id):
-    # Construct the URL for the Gutenberg project API
     url = f'{GUTENBERG_API_ENDPOINT}/files/{book_id}/{book_id}-0.txt'
 
-    # Send a GET request to the Gutenberg project API
     response = requests.get(url)
 
-    # Return the text from the response
     return response.text
 
 def fetch_book_title(book_id):
@@ -114,59 +88,96 @@ def fetch_book_title(book_id):
 
     response = requests.get(url).text
 
-    # Return the text from the response
-    return response[response.find("<title>")+7:response.find("</title>")]
+    title = response[response.find("<title>")+7:response.find("</title>")]
+
+    title = title[:title.find("|")] 
+    return title
+
+
+def chunk_text(text):
+    text_splitter = CharacterTextSplitter(separator="\n", chunk_size=20000, chunk_overlap=100)
+    chunks = text_splitter.split_text(text)
+    return chunks
+
+
+def analyze_title_with_groq(title, url):
+    client = Groq(
+        api_key=os.environ['GROQ_API_KEY']
+    )
+    prompt = """
+        You are an expert summarizer tasked with creating a final summary given book title and book url.
+        Combine the key points from the provided summaries into a cohesive and comprehensive summary.
+        The final summary should be concise formatted in JSON using the schema: {json_format} and include the following information: \n 1. Author\n 2. Language of the text\n 3. Overall Sentiment\n 4. Summary 5. Key Characters \n\n
+        book title: {title} \n
+        book url: {url}
+    """
+
+    chat_completion = client.chat.completions.create(
+        messages=[
+            {   
+                "role": "user",
+                "content": prompt.format(
+                    json_format=json.dumps(SummaryRecipe.model_json_schema(), indent=2),
+                    title=title,
+                    url=url)
+            }
+        ],
+        model="llama3-8b-8192",
+        response_format={"type": "json_object"}
+    )
+    final_details = json.loads(chat_completion.choices[0].message.content)
+
+    return final_details
 
 
 def analyze_text_with_groq(text):
     # Construct the headers for the Groq AI API
-    import pdb; pdb.set_trace()
     client = Groq(
-        api_key="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"
+        api_key=os.environ['GROQ_API_KEY']
     )
+    prompt_per_chunk = """You are a highly skilled AI model tasked with summarizing text.
+                    Please provide a 100-120 words summary for the following chunk of text in a concise manner,
+                    Also identify the key characters and mention the language of the text. Do not omit any key details:\n\n{document}"""
+    
+    prompt_for_all_summaries = """
+        You are an expert summarizer tasked with creating a final summary from summarized chunks.
+        Combine the key points from the provided summaries into a cohesive and comprehensive summary.
+        The final summary should be concise formatted in JSON using the schema: {json_format} and include the following information: \n 1. Author\n 2. Language of the text\n 3. Overall Sentiment\n 4. Summary 5. Key Characters \n\n{document}
+    """
+
+    summaries = []
+    chunks = chunk_text(text)
+    for chunk in chunks[:10]:
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {   
+                    "role": "user",
+                    "content": prompt_per_chunk.format(document=chunk)
+                }
+            ],
+            model="llama3-8b-8192",
+        )
+        summaries.append(chat_completion.choices[0].message.content)
+        print("Done chunk")
+    
+
+    all_summaries = "\n".join(summaries)
+
     chat_completion = client.chat.completions.create(
-    messages=[
-        {   
-            "role": "system",
-            "content": SYSTEM_PROMPT
-         },
-        {
-            "role": "user",
-            "content": f"""
-            text input:
-            {text}
-            Summary level: 7
-            output:
-            """
-        }
-    ],
-    model="mixtral-8x7b-32768",
-)
-    return chat_completion.choices[0].message.content
+        messages=[
+            {   
+                "role": "user",
+                "content": prompt_for_all_summaries.format(
+                    json_format=json.dumps(SummaryRecipe.model_json_schema(), indent=2),
+                    document=all_summaries)
+            }
+        ],
+        model="llama3-8b-8192",
+        response_format={"type": "json_object"}
+    )
+    final_details = json.loads(chat_completion.choices[0].message.content)
 
-    # headers = {
-    #     'Authorization': f'Bearer {GROQ_API_KEY}',
-    #     'Content-Type': 'application/json'
-    # }
-
-    # # Construct the payload for the Groq AI API
-    # payload = {
-    #     'text': text,
-    #     'model': 'story',
-    #     'output': 'json',
-    #     'tasks': [
-    #         {'task': 'key_characters'},
-    #         {'task': 'language'},
-    #         {'task': 'sentiment'},
-    #         {'task': 'plot_summary'}
-    #     ]
-    # }
-
-    # # Send a POST request to the Groq AI API
-    # response = requests.post(GROQ_API_ENDPOINT, headers=headers, json=payload)
-
-    # # Return the analysis from the response
-    # return response.json()
+    return final_details
 
 if __name__ == '__main__':
-    app.run(debug=True, host="0.0.0.0")
+    app.run(debug=True, host="0.0.0.0", port=80)
