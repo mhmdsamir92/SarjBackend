@@ -169,4 +169,4 @@ def analyze_text_with_groq(text):
     # return response.json()
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, host="0.0.0.0")
